@@ -14,19 +14,47 @@ import android.view.View
 import androidx.appcompat.app.AppCompatActivity
 import com.felhr.usbserial.UsbSerialDevice
 import com.felhr.usbserial.UsbSerialInterface
-import com.felhr.usbserial.UsbSerialInterface.UsbReadCallback
 import kotlinx.android.synthetic.main.activity_main.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers.IO
 import kotlinx.coroutines.Dispatchers.Main
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlin.random.Random
+import java.util.*
+import kotlin.collections.HashMap
+import kotlin.math.abs
+import kotlin.math.round
 
 
 class MainActivity : AppCompatActivity() {
-    private var keepRunning: Boolean = false
+    private var calibrationMultiplier: Double = 4.8131056776462474E-4
+    private var tareLevel: Double = 137612.0475
+
+    private var rawValueHistory: Queue<Int> = LinkedList<Int>()
+    private val maxHistory = 80 * 20
+
+    private fun addToHistory(value: Int) {
+        rawValueHistory.add(value)
+        while (rawValueHistory.size > maxHistory) {
+            rawValueHistory.remove()
+        }
+    }
+
+    private fun clearHistory() {
+        rawValueHistory = LinkedList<Int>()
+    }
+
+    private fun historyAverage(): Double {
+        var sum: Double = 0.0
+        var num: Int = 0
+        rawValueHistory.forEach { value ->
+            sum += value
+            num += 1
+        }
+
+        return sum / num
+    }
+
+    private var connectedState: Boolean = false
 
     lateinit var m_usbManager: UsbManager
     var m_device: UsbDevice? = null
@@ -44,34 +72,47 @@ class MainActivity : AppCompatActivity() {
         filter.addAction(UsbManager.ACTION_USB_ACCESSORY_ATTACHED)
         filter.addAction(UsbManager.ACTION_USB_ACCESSORY_DETACHED)
         registerReceiver(broadcastReceiver, filter)
+
+        if (!connectedState) {
+            startUsbConnect()
+        }
     }
 
     fun onClickStart(view: View) {
-        when (view.id) {
-            R.id.openBtn -> {
-                startUsbConnect()
-            }
-            R.id.closeBtn -> {
-                usbDisconnect()
-            }
-            R.id.updateBtn -> {
-                readData()
-            }
-            R.id.bkUpdateBtn -> {
-                if (keepRunning) {
-                    keepRunning = false
+        when (view) {
+            connectionBtn -> {
+                if (connectedState) {
+                    usbDisconnect()
                 } else {
-                    keepRunning = true
-                    CoroutineScope(IO).launch {
-                        updateReading()
-                    }
+                    startUsbConnect()
                 }
+            }
+            tareBtn -> {
+                tareLevel = historyAverage()
+                Log.i("Calibration", "Tare level is now $tareLevel")
+            }
+            calibrateBtn -> {
+                calibrationMultiplier = 20.0 / (historyAverage() - tareLevel)
+                Log.i("Calibration", "Calibration N is now $calibrationMultiplier")
             }
         }
     }
 
+    private fun updateConnectionState(connected: Boolean) {
+        connectedState = connected
+        if (connectedState) {
+            connectionBtn.text = "Disconnect"
+            calibrateBtn.isEnabled = true
+            tareBtn.isEnabled = true
+        } else {
+            connectionBtn.text = "Connect"
+            outputText.text = "---"
+            calibrateBtn.isEnabled = false
+            tareBtn.isEnabled = false
+        }
+    }
+
     private fun startUsbConnect() {
-        Log.i("Serial", "---------------------------------------------")
         val usbDevices: HashMap<String, UsbDevice>? = m_usbManager.deviceList
         if (usbDevices?.isNotEmpty()!!) {
             var keep = true
@@ -84,6 +125,7 @@ class MainActivity : AppCompatActivity() {
                     m_usbManager.requestPermission(m_device, intent)
                     keep = false
                     Log.i("Serial", "Connection successful to VID${m_device?.vendorId}")
+                    Log.i("WHERE", "------> 1")
                 } else {
                     Log.i("Serial", "Did not connect to vendorID: ${m_device?.vendorId}")
                     m_connection = null
@@ -98,18 +140,51 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun readData() {
-        m_serial?.read(mCallback)
+    private fun startRead() {
+        CoroutineScope(IO).launch { readData() }
     }
-    private val mCallback = UsbReadCallback {
-        val charset = Charsets.UTF_8
-        Log.i("Serial","READ:${it.toString(charset)}")
+
+    private suspend fun readData() {
+        m_serial?.read {
+            // Convert to string and match pattern
+            val charset = Charsets.UTF_8
+            val matchResult = Regex("([0-9]+)").find(it.toString(charset))
+            // If there is a match, then store
+            var rawValue: Int? = null
+            if (matchResult != null) rawValue = matchResult.groupValues[1].toInt()
+            // If that all worked, pass along raw value for processing
+            if (rawValue != null) {
+                CoroutineScope(Main).launch {
+                    if (abs(historyAverage() - rawValue) > 1 / calibrationMultiplier) {
+                        clearHistory()
+                    }
+
+                    addToHistory(rawValue)
+
+                    val printValue = applyTareAndCalibration(historyAverage()).toString()
+                    val decimalFind = Regex("\\.[0-9]+").find(printValue)
+                    var decimals = 3
+                    if (decimalFind != null) {
+                        decimals = decimalFind.value.length - 1
+                    }
+                    if (connectedState) {
+                        outputText.text = "$printValue" + "0".repeat(3 - decimals)
+                    }
+                }
+            }
+        }
     }
+
+    private fun applyTareAndCalibration(rawValue: Double): Double {
+        return round(((rawValue - tareLevel) * calibrationMultiplier) * 1e3) / 1e3
+    }
+
 
     private fun usbDisconnect() {
         if (m_serial != null) {
             m_serial!!.close()
         }
+        updateConnectionState(false)
     }
 
     private val broadcastReceiver = object : BroadcastReceiver() {
@@ -127,6 +202,9 @@ class MainActivity : AppCompatActivity() {
                             m_serial!!.setStopBits(UsbSerialInterface.STOP_BITS_1)
                             m_serial!!.setParity(UsbSerialInterface.PARITY_NONE)
                             m_serial!!.setFlowControl(UsbSerialInterface.FLOW_CONTROL_OFF)
+                            Log.i("WHERE", "------> 2")
+                            updateConnectionState(true)
+                            startRead()
                         } else {
                             Log.i("Serial", "Port is not open")
                         }
@@ -142,33 +220,6 @@ class MainActivity : AppCompatActivity() {
                 usbDisconnect()
             }
         }
-
     }
 
-    private suspend fun updateReading() {
-        val reading = getSerialData()
-        withContext(Main) { setOutputText(reading) }
-        if (keepRunning) {
-            updateReading()
-        }
-    }
-
-    private suspend fun setOutputText(newText: String) {
-        outputText.text = "$newText"
-    }
-
-    private suspend fun getSerialData(): String {
-//        logThread("getSerialData")
-
-        // Wait for data to be ready
-        delay(1000 / 80)
-        // Get data
-        val reading = Random.nextInt(1000, 5000).toString()
-        // Return data
-        return reading
-    }
-
-    private fun logThread(methodName: String) {
-        Log.d("THREADS", "${methodName}:${Thread.currentThread().name}")
-    }
 }
